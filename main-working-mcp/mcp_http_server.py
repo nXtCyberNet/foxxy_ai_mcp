@@ -176,6 +176,24 @@ MCP_TOOLS = [
     }
 ]
 
+# Safety controls for autonomous behavior prevention
+SAFETY_LIMITS = {
+    "max_consecutive_calls": 5,  # Max calls without human checkpoint
+    "cooldown_period_seconds": 30,  # Cooldown between operations
+    "max_operations_per_minute": 10,  # Rate limiting
+    "require_human_approval_after": 3  # Require approval after N operations
+}
+
+# Safety tracking
+safety_tracker = {
+    "consecutive_calls_by_tool": {},
+    "last_call_time_by_tool": {},
+    "operations_this_minute": 0,
+    "last_minute_reset": datetime.now(),
+    "pending_human_approval": set(),
+    "human_checkpoints": []
+}
+
 # Server statistics
 server_stats = {
     "total_requests": 0,
@@ -183,7 +201,9 @@ server_stats = {
     "approved_actions": 0,
     "denied_actions": 0,
     "average_risk_score": 25.0,
-    "server_start_time": datetime.now().isoformat()
+    "server_start_time": datetime.now().isoformat(),
+    "safety_blocks": 0,
+    "human_interventions": 0
 }
 
 def verify_iam_rules(user_context: Dict, action_type: str, target_element: Dict, iam_rules: List = None) -> Dict:
@@ -265,6 +285,91 @@ def validate_dom_operation(operation: str, target_domain: str, data_sensitivity:
         "cdp_browser_use_ready": approved
     }
 
+def check_safety_limits(tool_name: str, session_id: str = "default") -> Dict[str, Any]:
+    """Check if tool execution is within safety limits to prevent autonomous loops."""
+    global safety_tracker, server_stats
+    
+    current_time = datetime.now()
+    tool_key = f"{tool_name}:{session_id}"
+    
+    # Reset minute counter if needed
+    if (current_time - safety_tracker["last_minute_reset"]).seconds >= 60:
+        safety_tracker["operations_this_minute"] = 0
+        safety_tracker["last_minute_reset"] = current_time
+    
+    # Check rate limiting
+    if safety_tracker["operations_this_minute"] >= SAFETY_LIMITS["max_operations_per_minute"]:
+        server_stats["safety_blocks"] += 1
+        return {
+            "allowed": False,
+            "reason": "SAFE-T1106: Rate limit exceeded",
+            "mitigation": "Wait 60 seconds before next operation",
+            "safety_code": "RATE_LIMIT_EXCEEDED"
+        }
+    
+    # Check consecutive calls
+    consecutive_calls = safety_tracker["consecutive_calls_by_tool"].get(tool_key, 0)
+    if consecutive_calls >= SAFETY_LIMITS["max_consecutive_calls"]:
+        server_stats["safety_blocks"] += 1
+        return {
+            "allowed": False,
+            "reason": "SAFE-T1106: Autonomous looping behavior detected",
+            "mitigation": "Human checkpoint required before continuing",
+            "safety_code": "HUMAN_CHECKPOINT_REQUIRED",
+            "consecutive_calls": consecutive_calls
+        }
+    
+    # Check cooldown period
+    last_call_time = safety_tracker["last_call_time_by_tool"].get(tool_key)
+    if last_call_time:
+        cooldown_remaining = SAFETY_LIMITS["cooldown_period_seconds"] - (current_time - last_call_time).seconds
+        if cooldown_remaining > 0:
+            server_stats["safety_blocks"] += 1
+            return {
+                "allowed": False,
+                "reason": "SAFE-T1106: Cooldown period active",
+                "mitigation": f"Wait {cooldown_remaining} seconds before next operation",
+                "safety_code": "COOLDOWN_ACTIVE"
+            }
+    
+    # Check if human approval is pending
+    if consecutive_calls >= SAFETY_LIMITS["require_human_approval_after"]:
+        safety_tracker["pending_human_approval"].add(tool_key)
+        server_stats["safety_blocks"] += 1
+        return {
+            "allowed": False,
+            "reason": "SAFE-T1106: Human approval required",
+            "mitigation": "Operator must approve continuation of automated operations",
+            "safety_code": "HUMAN_APPROVAL_REQUIRED",
+            "approval_endpoint": "/approve_operation"
+        }
+    
+    # Update tracking
+    safety_tracker["consecutive_calls_by_tool"][tool_key] = consecutive_calls + 1
+    safety_tracker["last_call_time_by_tool"][tool_key] = current_time
+    safety_tracker["operations_this_minute"] += 1
+    
+    return {
+        "allowed": True,
+        "consecutive_calls": consecutive_calls + 1,
+        "operations_this_minute": safety_tracker["operations_this_minute"]
+    }
+
+def reset_safety_tracker(tool_name: str, session_id: str = "default") -> None:
+    """Reset safety tracker for a tool after human intervention."""
+    global safety_tracker, server_stats
+    
+    tool_key = f"{tool_name}:{session_id}"
+    safety_tracker["consecutive_calls_by_tool"][tool_key] = 0
+    safety_tracker["pending_human_approval"].discard(tool_key)
+    safety_tracker["human_checkpoints"].append({
+        "tool": tool_name,
+        "session": session_id,
+        "timestamp": datetime.now().isoformat(),
+        "action": "human_checkpoint"
+    })
+    server_stats["human_interventions"] += 1
+
 async def handle_mcp_request(request_data: Dict) -> Dict:
     """Handle MCP JSON-RPC 2.0 requests."""
     global server_stats
@@ -301,6 +406,25 @@ async def handle_mcp_request(request_data: Dict) -> Dict:
         elif method == "tools/call":
             tool_name = params.get("name")
             arguments = params.get("arguments", {})
+            session_id = arguments.get("user_context", {}).get("session_id", "default")
+            
+            # SAFETY CHECK: Prevent autonomous looping behavior
+            safety_check = check_safety_limits(tool_name, session_id)
+            if not safety_check["allowed"]:
+                return {
+                    "jsonrpc": "2.0",
+                    "id": request_id,
+                    "error": {
+                        "code": -32000,
+                        "message": safety_check["reason"],
+                        "data": {
+                            "safety_violation": True,
+                            "mitigation": safety_check["mitigation"],
+                            "safety_code": safety_check["safety_code"],
+                            "human_intervention_required": True
+                        }
+                    }
+                }
             
             server_stats["total_verifications"] += 1
             
@@ -476,11 +600,20 @@ async def root():
         "tools_count": len(MCP_TOOLS),
         "tools": [tool["name"] for tool in MCP_TOOLS],
         "server_stats": server_stats,
+        "safety_features": {
+            "autonomous_loop_prevention": "SAFE-T1106 compliant",
+            "human_checkpoints": "Required after 3 consecutive operations",
+            "rate_limiting": f"{SAFETY_LIMITS['max_operations_per_minute']} ops/minute",
+            "cooldown_period": f"{SAFETY_LIMITS['cooldown_period_seconds']} seconds"
+        },
         "endpoints": {
             "mcp": "POST / or POST /mcp",
             "health": "GET /",
             "docs": "GET /docs",
-            "openapi": "GET /openapi.json"
+            "openapi": "GET /openapi.json",
+            "approve_operation": "POST /approve_operation",
+            "safety_status": "GET /safety_status",
+            "reset_safety": "POST /reset_safety"
         }
     }
 
@@ -501,6 +634,99 @@ async def list_tools():
         "tools": MCP_TOOLS,
         "count": len(MCP_TOOLS)
     }
+
+@app.post("/approve_operation")
+async def approve_operation(request: Request):
+    """Human approval endpoint for continued automation (SAFE-T1106 mitigation)."""
+    try:
+        data = await request.json()
+        tool_name = data.get("tool_name")
+        session_id = data.get("session_id", "default")
+        operator_id = data.get("operator_id")
+        approval_reason = data.get("reason", "Manual approval")
+        
+        if not tool_name or not operator_id:
+            raise HTTPException(status_code=400, detail="tool_name and operator_id required")
+        
+        # Reset safety tracker
+        reset_safety_tracker(tool_name, session_id)
+        
+        # Log human intervention
+        logger.info(f"Human approval granted by {operator_id} for {tool_name}:{session_id}")
+        
+        return {
+            "approved": True,
+            "tool_name": tool_name,
+            "session_id": session_id,
+            "operator_id": operator_id,
+            "timestamp": datetime.now().isoformat(),
+            "safety_status": "human_checkpoint_completed",
+            "reason": approval_reason
+        }
+        
+    except Exception as e:
+        logger.error(f"Approval endpoint error: {e}")
+        raise HTTPException(status_code=500, detail="Approval processing failed")
+
+@app.get("/safety_status")
+async def get_safety_status():
+    """Get current safety status and metrics."""
+    global safety_tracker, server_stats
+    
+    return {
+        "safety_limits": SAFETY_LIMITS,
+        "current_tracking": {
+            "consecutive_calls": safety_tracker["consecutive_calls_by_tool"],
+            "pending_approvals": list(safety_tracker["pending_human_approval"]),
+            "operations_this_minute": safety_tracker["operations_this_minute"],
+            "human_checkpoints_count": len(safety_tracker["human_checkpoints"])
+        },
+        "safety_stats": {
+            "total_safety_blocks": server_stats["safety_blocks"],
+            "human_interventions": server_stats["human_interventions"],
+            "safety_compliance_rate": round(
+                (server_stats["total_requests"] - server_stats["safety_blocks"]) / 
+                max(1, server_stats["total_requests"]) * 100, 2
+            )
+        },
+        "recommendations": [
+            "Monitor consecutive call patterns",
+            "Ensure human operators are available for approvals",
+            "Consider implementing custom safety rules for specific workflows"
+        ]
+    }
+
+@app.post("/reset_safety")
+async def reset_safety(request: Request):
+    """Emergency safety reset endpoint (requires operator authorization)."""
+    try:
+        data = await request.json()
+        operator_id = data.get("operator_id")
+        reset_reason = data.get("reason", "Emergency reset")
+        
+        if not operator_id:
+            raise HTTPException(status_code=400, detail="operator_id required")
+        
+        # Reset all safety tracking
+        global safety_tracker
+        safety_tracker["consecutive_calls_by_tool"].clear()
+        safety_tracker["pending_human_approval"].clear()
+        safety_tracker["operations_this_minute"] = 0
+        safety_tracker["last_minute_reset"] = datetime.now()
+        
+        logger.warning(f"Safety reset performed by {operator_id}: {reset_reason}")
+        
+        return {
+            "reset": True,
+            "operator_id": operator_id,
+            "reason": reset_reason,
+            "timestamp": datetime.now().isoformat(),
+            "safety_status": "all_limits_reset"
+        }
+        
+    except Exception as e:
+        logger.error(f"Safety reset error: {e}")
+        raise HTTPException(status_code=500, detail="Safety reset failed")
 
 if __name__ == "__main__":
     print("=" * 70)
