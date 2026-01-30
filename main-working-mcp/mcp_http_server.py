@@ -441,7 +441,7 @@ async def handle_mcp_request(request_data: Dict) -> Dict:
 
 # HTTP Endpoints
 
-@app.post("/")
+@app.post("/mcp")
 async def mcp_root_endpoint(request: Request):
     """Main MCP endpoint for JSON-RPC 2.0 requests."""
     try:
@@ -517,7 +517,7 @@ if __name__ == "__main__":
         uvicorn.run(
             app,
             host="0.0.0.0",
-            port=8000,
+            port=8001,
             log_level="info"
         )
     except KeyboardInterrupt:
