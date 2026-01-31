@@ -63,8 +63,10 @@ def demonstrate_workflow():
                     "description": "Create complete audit trail for regulatory compliance",
                     "metadata": {
                         "retention_period": "7_years",
-                        "gdpr_compliant": True
-                    }
+                        "gdpr_compliant": True,
+                        "is_expired": False
+                    },
+                    "is_expired": False
                 }
             ]
         },

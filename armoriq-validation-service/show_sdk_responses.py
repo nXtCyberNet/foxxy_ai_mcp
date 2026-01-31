@@ -51,7 +51,8 @@ def mock_armoriq_responses():
                             "user_interaction": "form_validation",
                             "llm_response": "DOM operation validated successfully",
                             "browser_action": "security_check"
-                        }
+                        },
+                        "is_expired": False
                     }
                 ]
             }

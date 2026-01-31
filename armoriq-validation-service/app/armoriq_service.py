@@ -399,10 +399,11 @@ class ArmorIQValidationService:
         params: Optional[Dict] = None,
     ) -> MCPInvocationResult:
         """Internal tool execution method."""
+        print(f"gyguygyugyuguihuhuigylglyu: {token.token_id}")
         result = self.client.invoke(
             mcp=mcp_name,
             action=action,
-            intent_token=token,
+            intent_token=token.token_id,
             params=params or {},
             user_email=f"{self.user_id}@validation.armoriq.ai",
         )
@@ -444,7 +445,7 @@ class ArmorIQValidationService:
             return mcp_name, action_name
         else:
             # Default MCP for simple action names
-            return "default-mcp", tool_name
+            return "foxxy-ai", tool_name
 
     async def validate_execution_results(
         self,
