@@ -7,13 +7,14 @@ JSON-RPC 2.0 message handling for browser automation verification tools.
 """
 
 from fastapi import FastAPI, Request, HTTPException
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 import json
 import logging
+import asyncio
 from datetime import datetime
-from typing import Optional, Dict, List, Any, Union
+from typing import Optional, Dict, List, Any, Union, AsyncGenerator
 import uvicorn
 
 # Configure logging
@@ -370,6 +371,28 @@ def reset_safety_tracker(tool_name: str, session_id: str = "default") -> None:
     })
     server_stats["human_interventions"] += 1
 
+async def stream_sse_response(data: Dict) -> AsyncGenerator[str, None]:
+    """Stream response in Server-Sent Events format."""
+    try:
+        # Send the main response
+        yield f"data: {json.dumps(data)}\n\n"
+        
+        # Add a completion event
+        completion_event = {
+            "event": "completion",
+            "timestamp": datetime.now().isoformat(),
+            "status": "completed"
+        }
+        yield f"data: {json.dumps(completion_event)}\n\n"
+        
+    except Exception as e:
+        error_event = {
+            "event": "error",
+            "error": str(e),
+            "timestamp": datetime.now().isoformat()
+        }
+        yield f"data: {json.dumps(error_event)}\n\n"
+
 async def handle_mcp_request(request_data: Dict) -> Dict:
     """Handle MCP JSON-RPC 2.0 requests."""
     global server_stats
@@ -383,25 +406,36 @@ async def handle_mcp_request(request_data: Dict) -> Dict:
     
     try:
         if method == "initialize":
-            return {
+            logger.info("MCP Initialize request received")
+            response = {
                 "jsonrpc": "2.0",
                 "id": request_id,
                 "result": {
                     "protocolVersion": "2024-11-05",
-                    "capabilities": {"tools": {}},
+                    "capabilities": {
+                        "tools": {},
+                        "logging": {}
+                    },
                     "serverInfo": {
                         "name": "browser-automation-verification-mcp",
                         "version": "1.0.0"
                     }
                 }
             }
+            logger.info(f"Sending initialize response: {json.dumps(response, indent=2)}")
+            return response
             
         elif method == "tools/list":
-            return {
+            logger.info("MCP tools/list request received")
+            response = {
                 "jsonrpc": "2.0",
                 "id": request_id,
-                "result": {"tools": MCP_TOOLS}
+                "result": {
+                    "tools": MCP_TOOLS
+                }
             }
+            logger.info(f"Returning {len(MCP_TOOLS)} tools")
+            return response
             
         elif method == "tools/call":
             tool_name = params.get("name")
@@ -540,7 +574,17 @@ async def handle_mcp_request(request_data: Dict) -> Dict:
             
         elif method == "notifications/initialized":
             # Acknowledgment for initialization
+            logger.info("Client initialized notification received")
             return {"jsonrpc": "2.0", "result": {}}
+        
+        elif method == "ping":
+            # Handle ping requests
+            logger.info("Ping request received")
+            return {
+                "jsonrpc": "2.0",
+                "id": request_id,
+                "result": {}
+            }
             
         else:
             return {
@@ -565,23 +609,173 @@ async def handle_mcp_request(request_data: Dict) -> Dict:
 
 # HTTP Endpoints
 
-@app.post("/mcp")
-async def mcp_root_endpoint(request: Request):
-    """Main MCP endpoint for JSON-RPC 2.0 requests."""
-    try:
-        request_data = await request.json()
-        response = await handle_mcp_request(request_data)
-        return JSONResponse(content=response)
-    except json.JSONDecodeError:
-        raise HTTPException(status_code=400, detail="Invalid JSON")
-    except Exception as e:
-        logger.error(f"MCP endpoint error: {e}")
-        raise HTTPException(status_code=500, detail="Internal server error")
+# Removed duplicate endpoint to avoid routing conflicts - using consolidated mcp_endpoint below
 
-@app.post("/mcp")
-async def mcp_alt_endpoint(request: Request):
-    """Alternative MCP endpoint for JSON-RPC 2.0 requests."""
-    return await mcp_root_endpoint(request)
+# Removed redundant endpoint - using consolidated mcp_endpoint below
+
+@app.api_route("/mcp", methods=["GET", "POST", "OPTIONS"])
+async def mcp_endpoint(request: Request):
+    """Unified MCP endpoint supporting GET (SSE), POST (JSON-RPC), and OPTIONS."""
+    
+    # Handle CORS preflight
+    if request.method == "OPTIONS":
+        return JSONResponse(
+            content={},
+            headers={
+                "Access-Control-Allow-Origin": "*",
+                "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
+                "Access-Control-Allow-Headers": "Content-Type, Accept, Authorization",
+                "Access-Control-Max-Age": "86400"
+            }
+        )
+    
+    # Handle GET: Establish SSE Stream
+    if request.method == "GET":
+        async def event_generator():
+            # MCP protocol: Send endpoint where client should POST
+            endpoint_msg = {"type": "endpoint", "endpoint": "/mcp"}
+            yield f"event: message\n"
+            yield f"data: {json.dumps(endpoint_msg)}\n\n"
+            
+            # Send initialization message
+            init_msg = {
+                "jsonrpc": "2.0",
+                "method": "server/ready",
+                "params": {
+                    "serverInfo": {
+                        "name": "browser-automation-verification-mcp",
+                        "version": "1.0.0"
+                    },
+                    "capabilities": {"tools": {}},
+                    "protocolVersion": "2024-11-05"
+                }
+            }
+            yield f"event: message\n"
+            yield f"data: {json.dumps(init_msg)}\n\n"
+            
+            # Keep-alive heartbeat
+            try:
+                while True:
+                    await asyncio.sleep(30)
+                    yield ":heartbeat\n\n"
+            except asyncio.CancelledError:
+                logger.info("SSE stream cancelled")
+                return
+
+        logger.info("SSE Stream established via GET")
+        return StreamingResponse(
+            event_generator(), 
+            media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache",
+                "Connection": "keep-alive",
+                "Access-Control-Allow-Origin": "*",
+                "Access-Control-Allow-Headers": "Content-Type, Accept, Authorization"
+            }
+        )
+
+    # Handle POST: Process MCP JSON-RPC requests
+    if request.method == "POST":
+        try:
+            # Check if client wants SSE response
+            accept_header = request.headers.get("accept", "")
+            
+            body = await request.json()
+            method = body.get("method", "unknown")
+            logger.info(f"Received MCP request: {method}")
+            
+            result = await handle_mcp_request(body)
+            
+            # Return SSE response if requested
+            if "text/event-stream" in accept_header:
+                async def response_generator():
+                    yield f"event: message\n"
+                    yield f"data: {json.dumps(result)}\n\n"
+                
+                return StreamingResponse(
+                    response_generator(),
+                    media_type="text/event-stream",
+                    headers={
+                        "Cache-Control": "no-cache",
+                        "Connection": "keep-alive",
+                        "Access-Control-Allow-Origin": "*",
+                        "Access-Control-Allow-Headers": "*"
+                    }
+                )
+            else:
+                # Return standard JSON response
+                return JSONResponse(
+                    content=result,
+                    headers={
+                        "Access-Control-Allow-Origin": "*",
+                        "Access-Control-Allow-Headers": "*"
+                    }
+                )
+                
+        except json.JSONDecodeError as e:
+            logger.error(f"Invalid JSON in POST request: {e}")
+            return JSONResponse(
+                {"error": "Invalid JSON", "details": str(e)}, 
+                status_code=400
+            )
+        except Exception as e:
+            logger.error(f"POST processing error: {e}")
+            return JSONResponse(
+                {"error": "Internal server error", "details": str(e)}, 
+                status_code=500
+            )
+    
+    # Fallback for unsupported methods
+    return JSONResponse(
+        {"error": f"Method {request.method} not supported"}, 
+        status_code=405
+    )
+@app.get("/mcp/sse")
+async def mcp_sse_endpoint():
+    """Dedicated SSE endpoint for MCP transport."""
+    async def event_generator():
+        # Send endpoint information
+        endpoint_msg = {"type": "endpoint", "endpoint": "/mcp"}
+        yield f"event: message\n"
+        yield f"data: {json.dumps(endpoint_msg)}\n\n"
+        
+        # Send server capabilities
+        capabilities_msg = {
+            "jsonrpc": "2.0",
+            "method": "server/ready",
+            "params": {
+                "serverInfo": {
+                    "name": "browser-automation-verification-mcp",
+                    "version": "1.0.0"
+                },
+                "capabilities": {"tools": {}},
+                "protocolVersion": "2024-11-05",
+                "tools": MCP_TOOLS
+            }
+        }
+        yield f"event: message\n"
+        yield f"data: {json.dumps(capabilities_msg)}\n\n"
+        
+        # Keep connection alive
+        try:
+            while True:
+                await asyncio.sleep(20)
+                yield ":heartbeat\n\n"
+        except asyncio.CancelledError:
+            logger.info("Dedicated SSE stream cancelled")
+            return
+    
+    logger.info("Dedicated SSE endpoint accessed")
+    return StreamingResponse(
+        event_generator(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "Access-Control-Allow-Origin": "*",
+            "Access-Control-Allow-Headers": "*"
+        }
+    )
 
 @app.get("/")
 async def root():
@@ -607,13 +801,18 @@ async def root():
             "cooldown_period": f"{SAFETY_LIMITS['cooldown_period_seconds']} seconds"
         },
         "endpoints": {
-            "mcp": "POST / or POST /mcp",
+            "mcp": "POST / or POST /mcp (supports SSE with Accept: text/event-stream)",
+            "mcp_sse": "POST /mcp/sse (dedicated SSE endpoint)",
             "health": "GET /",
             "docs": "GET /docs",
             "openapi": "GET /openapi.json",
             "approve_operation": "POST /approve_operation",
             "safety_status": "GET /safety_status",
             "reset_safety": "POST /reset_safety"
+        },
+        "response_formats": {
+            "json": "Standard JSON responses",
+            "sse": "Server-Sent Events streaming (text/event-stream)"
         }
     }
 
@@ -733,17 +932,20 @@ if __name__ == "__main__":
     print("🤖 MCP-HTTP Browser Automation Verification Server")
     print("=" * 70)
     print("🌐 Protocol: Model Context Protocol over HTTP (JSON-RPC 2.0)")
+    print("� Response Formats: JSON + Server-Sent Events (SSE)")
     print("🔧 Tools: 4 verification and analytics tools")
-    print("📡 Host: 0.0.0.0:8001")
-    print("📚 Docs: http://localhost:8001/docs")
-    print("🔍 Health: http://localhost:8001/health")
+    print("📡 Host: 0.0.0.0:8002")
+    print("📚 Docs: http://localhost:8002/docs")
+    print("🔍 Health: http://localhost:8002/health")
+    print("📡 SSE: GET /mcp/sse or GET /mcp for stream")
+    print("🔧 MCP: POST /mcp for JSON-RPC calls")
     print("=" * 70)
     
     try:
         uvicorn.run(
             app,
             host="0.0.0.0",
-            port=8001,
+            port=8002,
             log_level="info"
         )
     except KeyboardInterrupt:
